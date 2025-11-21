@@ -1,94 +1,140 @@
-import os
-import random
 import csv
-from typing import Optional
-from fastapi import FastAPI
+import random
+import re
+import requests
+from datetime import datetime
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
-import uvicorn
+from typing import Optional
 
-# CSV file
-DATA_CSV = "Unstyled1.csv"
+app = FastAPI(title="Weather-Based Outfit Recommendation API")
 
-app = FastAPI(title="Outfit Suggestion API")
+# ==============================
+# File Paths
+# ==============================
+DATASET_FILE = "Unstyled1.csv"
+WEATHER_API_KEY = "e7b15095fe3450a04772a31d67478817"   # Your weather API key
 
-# -----------------------
-# Load the CSV file
-# -----------------------
-def load_csv(csv_path):
+
+# ==============================
+# Load & Clean CSV
+# ==============================
+def load_dataset():
     outfits = []
     try:
-        with open(csv_path, encoding="utf-8") as f:
-            reader = csv.DictReader(f)
+        with open(DATASET_FILE, newline="", encoding="utf-8") as csvfile:
+            reader = csv.DictReader(csvfile)
             for row in reader:
-                outfits.append(row)
+                normalized_row = {}
+
+                for k, v in row.items():
+                    if not v:
+                        continue
+
+                    key = k.strip().lower()
+                    value = v.strip()
+
+                    # Convert Excel HYPERLINK to real URL
+                    if value.startswith("=HYPERLINK"):
+                        match = re.search(r'\"(https?://[^\"]+)\"', value)
+                        if match:
+                            value = match.group(1)
+
+                    # Keep important columns only
+                    if key in ["event", "season", "topwear", "bottomwear", "footwear", "accessories", "gender"]:
+                        normalized_row[key] = value
+
+                outfits.append(normalized_row)
     except Exception as e:
-        print("Error loading CSV:", e)
+        print("Error loading dataset:", e)
+
     return outfits
 
-@app.on_event("startup")
-def startup_event():
-    global OUTFITS
-    OUTFITS = load_csv(DATA_CSV)
-    print(f"Loaded {len(OUTFITS)} outfits from CSV.")
 
-# -----------------------
-# Request Model
-# -----------------------
-class SuggestRequest(BaseModel):
-    event: str
-    season: Optional[str] = None
+DATASET = load_dataset()
 
-# -----------------------
-# Filtering Function (CLEANED)
-# -----------------------
-def filter_outfits(event, season=None):
-    event = event.lower().strip()
-    season = season.lower().strip() if season else None
 
-    results = []
+# ==============================
+# IP → City
+# ==============================
+def get_location():
+    try:
+        res = requests.get("https://ipinfo.io")
+        return res.json().get("city")
+    except:
+        return None
 
-    for row in OUTFITS:
-        # Clean and normalize text
-        event_col = str(row.get("Event") or "").lower().strip()
-        season_col = str(row.get("season") or "").lower().strip()
 
-        # Remove leftover characters from HYPERLINK()
-        event_col = event_col.replace('")', '').replace('"', '')
-        season_col = season_col.replace('")', '').replace('"', '')
+# ==============================
+# Weather → Season
+# ==============================
+def get_season_from_weather(city):
+    try:
+        url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_API_KEY}&units=metric"
+        res = requests.get(url).json()
+        temp = res["main"]["temp"]
 
-        # Match event & season
-        if event in event_col:
-            if season:
-                if season in season_col:
-                    results.append(row)
-            else:
-                results.append(row)
+        if temp >= 25:
+            return "summer"
+        elif temp <= 15:
+            return "winter"
+        else:
+            return "rainy"
+    except:
+        return "summer"  # default
 
-    return results
 
-# -----------------------
-# API Endpoints
-# -----------------------
+# ==============================
+# Find Matching Outfits
+# ==============================
+def find_outfits(event, season):
+    matches = []
+
+    for row in DATASET:
+        row_event = row.get("event", "").strip().lower()
+        row_season = row.get("season", "").strip().lower()
+
+        if event.lower() == row_event and season.lower() == row_season:
+            matches.append(row)
+
+    return matches
+
+
+# ==============================
+# FastAPI Routes
+# ==============================
 @app.get("/")
 def home():
-    return {"message": "Outfit Suggestion API working!"}
+    return {"message": "Weather-Based Outfit Recommendation API is running!"}
+
 
 @app.get("/suggest")
-def suggest(event: str, season: Optional[str] = None):
-    matches = filter_outfits(event, season)
-    if not matches:
-        return {"found": False, "message": "No matching outfits"}
-    return {"found": True, "outfit": random.choice(matches)}
+def suggest(event: str = Query(..., description="Type of event: office, party, trip, marriage, etc.")):
+    # Step 1: Get city via IP
+    city = get_location()
+    if not city:
+        season = "summer"  # fallback
+    else:
+        season = get_season_from_weather(city)
 
-@app.post("/suggest")
-def suggest_post(req: SuggestRequest):
-    matches = filter_outfits(req.event, req.season)
-    if not matches:
-        return {"found": False, "message": "No matching outfits"}
-    return {"found": True, "outfit": random.choice(matches)}
+    # Step 2: Find matching outfits
+    outfits = find_outfits(event, season)
 
-# -----------------------
-# Local Run
-# -----------------------
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    if not outfits:
+        return {
+            "success": False,
+            "message": f"No outfits found for event '{event}' in season '{season}'.",
+            "season_detected": season,
+            "city_detected": city
+        }
+
+    # Step 3: Pick random outfit
+    selected = random.choice(outfits)
+
+    return {
+        "success": True,
+        "event": event,
+        "season_detected": season,
+        "city_detected": city,
+        "outfit": selected
+    }
